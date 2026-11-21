@@ -53,7 +53,8 @@ internal val NAV_BAR_NATIVE_TAB_OPTIONS =
 
 internal data class NavBarItemContentTarget(
     val method: MutableMethod,
-    val navigationField: FieldReference,
+    /** Receiver field holding the tab; null when the content is static and takes the tab directly. */
+    val navigationField: FieldReference?,
     val iconType: String,
     val tabDataValueType: String,
     val rendererCallIndex: Int,
@@ -62,6 +63,8 @@ internal data class NavBarItemContentTarget(
     val tabDataValueRegister: Int,
     val thisRegister: Int,
     val tabIconFields: Map<String, FieldReference>,
+    /** Register offset from p0 of the value preserved in [thisRegister] at method entry. */
+    val preservedParameterOffset: Int = 0,
 )
 
 /** Resolved NewX navigation tab data shared by all navigation bar patches. */
@@ -433,6 +436,9 @@ internal fun resolveNavBarItemContent(tabData: NewXNavBarTabData): NavBarItemCon
                     }
             } == true
         }
+    if (consumerClasses.isEmpty()) {
+        resolveStaticNavBarItemContent(tabData, renderer, rendererCalls)?.let { return it }
+    }
     // This is a read-only discovery pass. Converting every class to a mutable proxy here keeps
     // the whole APK alive and can exceed the manager's 512 MB minimum heap on large NewX builds.
     val consumerClass =
@@ -507,6 +513,134 @@ internal fun resolveNavBarItemContent(tabData: NewXNavBarTabData): NavBarItemCon
         thisRegister = originalRegisterCount,
         tabIconFields = consumerMethod.resolveNavigationTabIcons(tabData.navigationType, iconRegister),
     )
+}
+
+/**
+ * 12.45+ renders each item from a static composable taking the tab and its tab data directly, and
+ * maps the tab to its selected/unselected icon in two `(tab) -> Icon` functions.
+ */
+private fun resolveStaticNavBarItemContent(
+    tabData: NewXNavBarTabData,
+    renderer: MethodReference,
+    rendererCalls: List<Match>,
+): NavBarItemContentTarget? {
+    val rendererDescriptor = renderer.toSmaliDescriptor()
+    val contentMethods =
+        rendererCalls.map { it.originalMethod }.filter { method ->
+            val parameters = method.parameterTypes.map(CharSequence::toString)
+            method.accessFlags and com.android.tools.smali.dexlib2.AccessFlags.STATIC.value != 0 &&
+                method.returnType == "V" &&
+                parameters.count { it == tabData.navigationType } == 1 &&
+                parameters.count { it == tabData.tabDataValueType } == 1
+        }.distinctBy { ImmutableMethodReference(it.definingClass, it.name, it.parameterTypes, it.returnType).toSmaliDescriptor() }
+    val content = contentMethods.singleOrNull() ?: return null
+    val parameters = content.parameterTypes.map(CharSequence::toString)
+    val navigationOffset =
+        parameters.take(parameters.indexOf(tabData.navigationType)).sumOf { if (it == "J" || it == "D") 2 else 1 }
+    val classDef = mutableClassDefBy(content.definingClass)
+    val originalMethod =
+        requireExactlyOne(
+            "NewX navigation bar static item content $content",
+            classDef.methods.filter { method ->
+                method.name == content.name && method.returnType == content.returnType &&
+                    method.parameterTypes.map(CharSequence::toString) == parameters
+            },
+        ) { it.toString() }
+    val originalRegisterCount =
+        originalMethod.implementation?.registerCount
+            ?: throw PatchException("NewX navigation bar item content has no implementation: $originalMethod")
+    val consumerMethod =
+        originalMethod.cloneMutable(additionalRegisters = originalMethod.numberOfParameterRegisters + 1)
+    classDef.methods.remove(originalMethod)
+    classDef.methods.add(consumerMethod)
+
+    val rendererCallIndex =
+        requireExactlyOne(
+            "NewX navigation bar item renderer call",
+            consumerMethod.instructions.mapIndexedNotNull { index, instruction ->
+                index.takeIf { instruction.referencesMethod(rendererDescriptor) }
+            },
+        ) { it.toString() }
+    val rendererCall =
+        consumerMethod.instructions.getOrNull(rendererCallIndex) as? Instruction35c
+            ?: throw PatchException("NewX navigation bar item renderer call is not a 5-register invoke")
+    val iconType = renderer.parameterTypes.first().toString()
+    return NavBarItemContentTarget(
+        method = consumerMethod,
+        navigationField = null,
+        iconType = iconType,
+        tabDataValueType = tabData.tabDataValueType,
+        rendererCallIndex = rendererCallIndex,
+        iconRegister = rendererCall.registerC,
+        labelRegister = rendererCall.registerD,
+        tabDataValueRegister = rendererCall.registerE,
+        thisRegister = originalRegisterCount,
+        tabIconFields = consumerMethod.resolveMappedNavigationTabIcons(tabData.navigationType, iconType),
+        preservedParameterOffset = navigationOffset,
+    )
+}
+
+/**
+ * Reads the tab icons from the `(tab) -> Icon` mappers the content calls. The selected mapper is
+ * called first and the unselected one second, matching the inline switch order of older releases.
+ */
+private fun MutableMethod.resolveMappedNavigationTabIcons(
+    navigationType: String,
+    iconType: String,
+): Map<String, FieldReference> {
+    val mappers =
+        instructions.mapNotNull { instruction ->
+            if (instruction.opcode != Opcode.INVOKE_STATIC) return@mapNotNull null
+            instruction.getReference<MethodReference>()?.takeIf { reference ->
+                reference.returnType == iconType &&
+                    reference.parameterTypes.map(CharSequence::toString) == listOf(navigationType)
+            }
+        }.distinctBy { it.toSmaliDescriptor() }
+    if (mappers.size != 2) {
+        throw PatchException("Expected two NewX navigation icon mappers, found ${mappers.size}: $this")
+    }
+    val unselected = mappers.last()
+    val mapper =
+        requireExactlyOne(
+            "NewX navigation icon mapper $unselected",
+            mutableClassDefBy(unselected.definingClass).methods.filter { method ->
+                method.name == unselected.name && method.returnType == unselected.returnType &&
+                    method.parameterTypes.map(CharSequence::toString) == listOf(navigationType)
+            },
+        ) { it.toString() }
+    val mappingField =
+        requireExactlyOne(
+            "NewX navigation icon mapper mapping array",
+            mapper.instructions.filter { instruction ->
+                instruction.opcode == Opcode.SGET_OBJECT && instruction.getReference<FieldReference>()?.type == "[I"
+            }.mapNotNull { it.getReference<FieldReference>() }.distinctBy(FieldReference::toString),
+        ) { it.toString() }
+    val enumCases = resolveEnumSwitchCases(navigationType, mappingField)
+    val switchIndex =
+        requireExactlyOne(
+            "NewX navigation icon mapper switch",
+            mapper.instructions.withIndex().filter { it.value.opcode == Opcode.PACKED_SWITCH }.map { it.index },
+        ) { it.toString() }
+    val cases = mapper.packedSwitchCases(switchIndex)
+    val mapperInstructions = mapper.instructions.toList()
+    return NAV_BAR_NATIVE_TAB_OPTIONS.associate { (name, _) ->
+        val key =
+            enumCases[name] ?: throw PatchException("NewX navigation when mapping has no case for $name: $mapper")
+        val switchCase =
+            requireExactlyOne(
+                "NewX navigation icon mapper case for $name",
+                cases.filter { it.key == key },
+            ) { it.toString() }
+        val returnRegister =
+            (switchCase.startIndex until switchCase.endIndex).firstNotNullOfOrNull { index ->
+                mapperInstructions[index].takeIf { it.opcode == Opcode.RETURN_OBJECT }
+                    ?.let { (it as OneRegisterInstruction).registerA }
+            } ?: throw PatchException("NewX navigation icon mapper case for $name does not return: $mapper")
+        name to (
+            mapperInstructions.resolveCaseIconField(switchCase, returnRegister)
+                ?: throw PatchException("NewX navigation icon mapper case for $name has no icon: $mapper")
+        )
+    }
 }
 
 internal data class PackedSwitchCase(

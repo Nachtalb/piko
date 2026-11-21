@@ -256,19 +256,19 @@ private fun NavBarItemContentTarget.injectReplacementOverride(tabDataConstructor
         // The receiver is preserved in a local above the original frame, so it is moved into the
         // four-bit work register before every field read (format 22c cannot encode the receiver).
         move(workRegister, thisRegister, OBJECT_DESCRIPTOR)
-        iget(workRegister, workRegister, navigationField)
+        navigationField?.let { field -> iget(workRegister, workRegister, field) }
         invokeStatic(methodReference(OVERRIDE_ICON_DESCRIPTOR), workRegister, iconRegister)
         moveResult(workRegister, iconType)
         checkCast(workRegister, iconType)
         move(iconRegister, workRegister, OBJECT_DESCRIPTOR)
 
         move(workRegister, thisRegister, OBJECT_DESCRIPTOR)
-        iget(workRegister, workRegister, navigationField)
+        navigationField?.let { field -> iget(workRegister, workRegister, field) }
         invokeStatic(methodReference(OVERRIDE_LABEL_DESCRIPTOR), workRegister, labelRegister)
         moveResult(labelRegister, STRING_DESCRIPTOR)
 
         move(workRegister, thisRegister, OBJECT_DESCRIPTOR)
-        iget(workRegister, workRegister, navigationField)
+        navigationField?.let { field -> iget(workRegister, workRegister, field) }
         invokeStatic(methodReference(SHOULD_CLEAR_BADGE_DESCRIPTOR), workRegister)
         moveResult(workRegister, "Z")
         ifEqz(workRegister, Target.Original)
@@ -285,7 +285,9 @@ private fun NavBarItemContentTarget.injectReplacementOverride(tabDataConstructor
 
     // Preserve the receiver before the compiler reuses the parameter registers for the icon and
     // the resolved label. Inserted last so the renderer call index above stayed valid.
-    method.insertHook(index = 0, relocateBranchTargets = false) { move(thisRegister, method.p0Register, OBJECT_DESCRIPTOR) }
+    method.insertHook(index = 0, relocateBranchTargets = false) {
+        move(thisRegister, method.p0Register + preservedParameterOffset, OBJECT_DESCRIPTOR)
+    }
 }
 
 private data class DrawerRowCall(
