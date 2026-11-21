@@ -1159,7 +1159,8 @@ private fun resolveNativePhotoViewerTarget(
     // Controller, destination, and navigate call are all derived from the call graph:
     // the controller field's class must declare a (destination, Z) -> V method whose
     // destination is a supertype of the resolved route (kj/k(jj,Z) on old targets,
-    // sj/k(rj,Z) on alpha.04). Never hardcode either descriptor; R8 reassigns them.
+    // sj/k(rj,Z) on alpha.04, pp/h(ve,Z) on 12.45). The call must be made by the media
+    // event handler itself. Never hardcode either descriptor; R8 reassigns them.
     val navigationCandidates =
         hostClass.fields.flatMap { field ->
             val navigationClass =
@@ -1171,6 +1172,10 @@ private fun resolveNativePhotoViewerTarget(
                 if (method.returnType != "V") return@mapNotNull null
                 if (!parameters[0].startsWith("L")) return@mapNotNull null
                 if (!classImplements(routeClass, parameters[0])) return@mapNotNull null
+                // 12.45 holds several R8-merged controllers of one class that also expose a
+                // (destination, Z) -> V method; only the controller the handler navigates with
+                // is the photo navigator.
+                if (method.toNativeCall().descriptor !in hostAccessorDescriptors) return@mapNotNull null
                 Triple(field, method, parameters[0])
             }
         }
