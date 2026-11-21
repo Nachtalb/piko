@@ -47,6 +47,7 @@ import app.crimera.patches.newx.timeline.primaryPostFabRendererCallIndices
 import app.crimera.patches.newx.timeline.readsArrayListFromParameter
 import app.crimera.patches.newx.timeline.timelineModuleDividerItemIndices
 import app.crimera.patches.newx.misc.dynamiccolor.resolveTabIndicatorTintSite
+import app.crimera.patches.newx.misc.replysorting.ReplySortingSelectionSite
 import app.crimera.patches.newx.misc.replysorting.installReplySortingSelectionHook
 import app.crimera.patches.newx.misc.replysorting.resolveReplySortingSelectionSite
 import app.crimera.tools.lint.ResolverLinter
@@ -2291,6 +2292,49 @@ class NewXResolverLinterTest {
         assertEquals(site.register, (code[store] as TwoRegisterInstruction).registerA)
         val branch = code.first { it.opcode == Opcode.IF_EQZ } as BuilderOffsetInstruction
         assertEquals(store - 1, branch.target.location.index, "the incoming branch must run remember before the store")
+    }
+
+    @Test
+    fun `reply sorting selection resolves a typed presenter handler without a cast and rejects stores of other values`() {
+        val typed = typedReplySelectionFixture(storeParameter = true)
+        val instructions = typed.implementation!!.instructions.toList()
+        val site = resolveReplySortingSelectionSite(typed, replyEnum, typed.defaultUrtIndex())
+        assertEquals(ReplySortingSelectionSite.NO_CAST, site.castIndex)
+        assertEquals(instructions.indexOfFirst { it.opcode == Opcode.IPUT_OBJECT }, site.storeIndex)
+        assertEquals(site.register, (instructions[site.storeIndex] as TwoRegisterInstruction).registerA)
+
+        val decoy = typedReplySelectionFixture(storeParameter = false)
+        assertFailsWith<PatchException> {
+            resolveReplySortingSelectionSite(decoy, replyEnum, decoy.defaultUrtIndex())
+        }
+        // A typed parameter of another enum is not a reply sorting handler.
+        assertFailsWith<PatchException> {
+            resolveReplySortingSelectionSite(typed, "Lfixture/OtherMode;", typed.defaultUrtIndex())
+        }
+    }
+
+    // 12.45 shape: `fun V(mode: RankingMode)` publishes the mode to a flow, then stores it before the anchor.
+    private fun typedReplySelectionFixture(storeParameter: Boolean): ImmutableMethod {
+        val holder = "Lfixture/ReplyHolder;"
+        val implementation = MethodImplementationBuilder(4).apply {
+            fun add(instruction: String) = addInstruction(instruction.toInstruction())
+            add("iget-object v0, v2, Lfixture/ReplyPresenter;->state:Lfixture/StateFlow;")
+            add("const/4 v1, 0x0")
+            add("invoke-virtual {v0, v1, v3}, Lfixture/StateFlow;->compareAndSet(Ljava/lang/Object;Ljava/lang/Object;)Z")
+            add("iget-object v0, v2, Lfixture/ReplyPresenter;->holder:$holder")
+            if (storeParameter) {
+                add("iput-object v3, v0, $holder->value:Ljava/lang/Object;")
+            } else {
+                add("iput-object v1, v0, $holder->value:Ljava/lang/Object;")
+            }
+            add("const-string v2, \"defaultUrtTimelineComponent\"")
+            add("return-void")
+        }
+        return ImmutableMethod(
+            "Lfixture/ReplyPresenter;", "V",
+            listOf(ImmutableMethodParameter(replyEnum, emptySet(), null)), "V",
+            AccessFlags.PUBLIC.value, emptySet(), emptySet(), implementation.methodImplementation,
+        )
     }
 
     private fun Method.defaultUrtIndex(): Int = implementation!!.instructions.indexOfFirst { instruction ->

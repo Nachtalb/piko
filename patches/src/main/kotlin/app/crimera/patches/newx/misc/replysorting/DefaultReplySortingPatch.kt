@@ -160,6 +160,23 @@ private object NewXComposeReplySortingSelectionFingerprint : Fingerprint(
 )
 
 /**
+ * 12.45 moved the selection body out of the function reference into a typed presenter method
+ * (`fun onSortSelected(mode: TimelineRankingMode)`); the reference only forwards to it. Same
+ * strings, but the choice arrives as the ranking enum itself, so there is no narrowing cast.
+ */
+private fun newXTypedReplySortingSelectionFingerprint(enumClass: String) =
+    Fingerprint(
+        returnType = "V",
+        parameters = listOf(enumClass),
+        isStatic = false,
+        filters =
+            listOf(
+                string("timelineRepository"),
+                string("defaultUrtTimelineComponent"),
+            ),
+    )
+
+/**
  * Targets the Compose state initializer that seeds the reply-sorting sheet with
  * `mutableStateOf(TimelineRankingMode.Relevance)`.
  */
@@ -238,19 +255,25 @@ private fun seedFeedsRequest(
 /**
  * A validated selection: the check-cast that narrows the selected callback parameter to the
  * resolved ranking enum, and the field store of that same value. [register] is the store's value
- * register, which holds the chosen enum on every incoming path to [storeIndex].
+ * register, which holds the chosen enum on every incoming path to [storeIndex]. A typed handler
+ * (12.45+) receives the enum directly; its [castIndex] is [NO_CAST].
  */
 internal data class ReplySortingSelectionSite(
     val castIndex: Int,
     val storeIndex: Int,
     val register: Int,
-)
+) {
+    companion object {
+        const val NO_CAST = -1
+    }
+}
 
 /**
  * Resolves the single cast-to-store tuple that persists the reply-sorting choice. The callback
  * parameter is located from the instance-method register layout, and the cast and store are proven
  * through the shared all-path provenance helpers, so branch-local moves and clobbers are handled
- * without assuming adjacency or fixed registers.
+ * without assuming adjacency or fixed registers. A handler whose single parameter already is
+ * [enumClass] needs no cast: the store is proven straight from the parameter.
  */
 internal fun resolveReplySortingSelectionSite(
     method: Method,
@@ -259,14 +282,16 @@ internal fun resolveReplySortingSelectionSite(
 ): ReplySortingSelectionSite {
     val implementation = method.implementation
         ?: throw PatchException("Reply sorting selection handler has no implementation")
+    val parameterTypes = method.parameterTypes.map(CharSequence::toString)
+    val typedParameter = parameterTypes == listOf(enumClass)
     if (AccessFlags.STATIC.isSet(method.accessFlags) ||
-        method.parameterTypes.map(CharSequence::toString) != listOf("Ljava/lang/Object;")
+        (parameterTypes != listOf("Ljava/lang/Object;") && !typedParameter)
     ) {
         throw PatchException(
             "Unexpected reply sorting selection handler parameters: ${method.parameterTypes}",
         )
     }
-    // The receiver and the single Object argument occupy the last two registers.
+    // The receiver and the single object argument occupy the last two registers.
     val selectedParameterRegister = implementation.registerCount - 1
     if (selectedParameterRegister < 1) {
         throw PatchException("Invalid reply sorting selection handler register layout")
@@ -280,6 +305,7 @@ internal fun resolveReplySortingSelectionSite(
         )
     }
     val castSites = instructions.withIndex().mapNotNull { (index, instruction) ->
+        if (typedParameter) return@mapNotNull null
         if (index >= defaultUrtIndex || instruction.opcode != Opcode.CHECK_CAST) return@mapNotNull null
         val cast = instruction as? OneRegisterInstruction ?: return@mapNotNull null
         if (instruction.getReference<TypeReference>()?.type != enumClass) return@mapNotNull null
@@ -291,23 +317,38 @@ internal fun resolveReplySortingSelectionSite(
 
     val successors = method.normalControlFlowSuccessors()
         ?: throw PatchException("Reply sorting selection handler has unsupported control flow: $method")
-    val sites = castSites.flatMap { (castIndex, castRegister) ->
-        instructions.withIndex().mapNotNull { (storeIndex, instruction) ->
-            if (storeIndex <= castIndex || storeIndex >= defaultUrtIndex) return@mapNotNull null
-            if (instruction.opcode != Opcode.IPUT_OBJECT) return@mapNotNull null
-            val store = instruction as? TwoRegisterInstruction ?: return@mapNotNull null
-            val fieldType = instruction.getReference<FieldReference>()?.type
-            if (fieldType != "Ljava/lang/Object;" && fieldType != enumClass) return@mapNotNull null
-            // A store in an unrelated returning arm cannot feed the boundary, so it is not a selection.
-            if (defaultUrtIndex !in successors.reachableIndicesFrom(storeIndex).orEmpty()) {
-                return@mapNotNull null
-            }
-            if (!method.provesValueFromInstruction(castIndex, castRegister, storeIndex, store.registerA)) {
-                return@mapNotNull null
-            }
-            ReplySortingSelectionSite(castIndex, storeIndex, store.registerA)
-        }
+
+    fun storeCandidate(storeIndex: Int, instruction: Instruction, afterIndex: Int): TwoRegisterInstruction? {
+        if (storeIndex <= afterIndex || storeIndex >= defaultUrtIndex) return null
+        if (instruction.opcode != Opcode.IPUT_OBJECT) return null
+        val store = instruction as? TwoRegisterInstruction ?: return null
+        val fieldType = instruction.getReference<FieldReference>()?.type
+        if (fieldType != "Ljava/lang/Object;" && fieldType != enumClass) return null
+        // A store in an unrelated returning arm cannot feed the boundary, so it is not a selection.
+        if (defaultUrtIndex !in successors.reachableIndicesFrom(storeIndex).orEmpty()) return null
+        return store
     }
+
+    val sites =
+        if (typedParameter) {
+            instructions.withIndex().mapNotNull { (storeIndex, instruction) ->
+                val store = storeCandidate(storeIndex, instruction, -1) ?: return@mapNotNull null
+                if (!method.provesParameterValue(storeIndex, store.registerA, selectedParameterRegister)) {
+                    return@mapNotNull null
+                }
+                ReplySortingSelectionSite(ReplySortingSelectionSite.NO_CAST, storeIndex, store.registerA)
+            }
+        } else {
+            castSites.flatMap { (castIndex, castRegister) ->
+                instructions.withIndex().mapNotNull { (storeIndex, instruction) ->
+                    val store = storeCandidate(storeIndex, instruction, castIndex) ?: return@mapNotNull null
+                    if (!method.provesValueFromInstruction(castIndex, castRegister, storeIndex, store.registerA)) {
+                        return@mapNotNull null
+                    }
+                    ReplySortingSelectionSite(castIndex, storeIndex, store.registerA)
+                }
+            }
+        }
 
     return requireExactlyOne(
         label = "reply sorting selection cast-to-store site for $enumClass",
@@ -458,7 +499,10 @@ val newXDefaultReplySortingPatch =
                     label = "NewX Compose reply sorting selection handler",
                     candidates = NewXComposeReplySortingSelectionFingerprint
                         .matchAllOrNull()
-                        .orEmpty(),
+                        .orEmpty() +
+                        newXTypedReplySortingSelectionFingerprint(enumClass)
+                            .matchAllOrNull()
+                            .orEmpty(),
                 )
             val selectionMethod = selectionMatch.method
             // Resolve the anchor from the live method rather than the cached match indexes, so earlier
