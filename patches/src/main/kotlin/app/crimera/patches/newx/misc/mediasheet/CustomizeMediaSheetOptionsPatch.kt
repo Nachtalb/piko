@@ -3,6 +3,10 @@ package app.crimera.patches.newx.misc.mediasheet
 import app.crimera.patches.newx.utils.unsupportedOnMount
 import app.crimera.bytecode.insertHook
 import app.crimera.bytecode.methodReference
+import app.crimera.patches.newx.models.ModelFieldAccessor
+import app.crimera.patches.newx.models.fieldForToStringLabel
+import app.crimera.patches.newx.models.readModelAccessor
+import app.crimera.patches.newx.models.resolveFieldAccessor
 import app.crimera.patches.newx.settings.Categories
 import app.crimera.patches.settings.MultiChoiceSettingDefinition
 import app.crimera.patches.settings.SettingReadRegisterConstraint
@@ -37,8 +41,10 @@ import com.android.tools.smali.dexlib2.iface.reference.MethodReference
 
 private const val MEDIA_SHEET_FILTER_SIGNATURE =
     "filter(Ljava/util/List;Ljava/util/Set;)Ljava/util/List;"
+private const val ROW_TITLE_LABEL = ", title="
 private const val LABEL_BRIDGE_NAME = "getLabelResourceId"
-private const val IMMUTABLE_LIST_DESCRIPTOR = "Lkotlinx/collections/immutable/b;"
+/** R8 renames kotlinx ImmutableList per release (b in 12.43, c in 12.45); match it by shape. */
+private const val IMMUTABLE_COLLECTIONS_PACKAGE = "Lkotlinx/collections/immutable/"
 private const val ITERABLE_DESCRIPTOR = "Ljava/lang/Iterable;"
 private const val INT_DESCRIPTOR = "I"
 private const val OBJECT_DESCRIPTOR = "Ljava/lang/Object;"
@@ -98,7 +104,7 @@ private object MediaSheetBuilderFingerprint : Fingerprint(
 private data class ResolvedMediaSheetLabel(
     val rowDescriptor: String,
     val labelDescriptor: String,
-    val labelGetter: MethodReference,
+    val labelAccessor: ModelFieldAccessor,
     val labelResourceField: FieldReference,
 )
 
@@ -209,11 +215,19 @@ private fun resolveMediaSheetLabelModel(match: Match): ResolvedMediaSheetLabel {
         classDefByOrNull(rowConstructor.definingClass)
             ?: throw PatchException("NewX media-sheet row class was not found: ${rowConstructor.definingClass}")
 
-    val labelGetters =
-        rowClass.methods.filter { candidate ->
-            candidate.parameterTypes.isEmpty() && candidate.returnType == labelBase
-        }
-    val labelGetter = requireExactlyOne("NewX media-sheet label getter in ${rowClass.type}", labelGetters)
+    // 12.45 inlined the title getter, so read the title through whichever accessor the release
+    // still has (getter or public field), picked by its toString label rather than by shape.
+    val rowToString =
+        rowClass.methods.singleOrNull { candidate ->
+            candidate.name == "toString" && candidate.parameterTypes.isEmpty()
+        } ?: throw PatchException("NewX media-sheet row toString was not found in ${rowClass.type}")
+    val titleField = rowToString.fieldForToStringLabel(ROW_TITLE_LABEL)
+    if (titleField.definingClass != rowClass.type || titleField.type != labelBase) {
+        throw PatchException(
+            "NewX media-sheet row title field has an unexpected shape in ${rowClass.type}: $titleField",
+        )
+    }
+    val labelAccessor = mutableClassDefBy(rowClass.type).resolveFieldAccessor(titleField, "media-sheet row title")
 
     val labelResourceFields =
         labelClass.fields.filter { field ->
@@ -225,7 +239,7 @@ private fun resolveMediaSheetLabelModel(match: Match): ResolvedMediaSheetLabel {
     return ResolvedMediaSheetLabel(
         rowDescriptor = rowClass.type,
         labelDescriptor = labelClass.type,
-        labelGetter = labelGetter,
+        labelAccessor = labelAccessor,
         labelResourceField = labelResourceField,
     )
 }
@@ -240,9 +254,9 @@ private fun filterMediaSheetOptions(
             val reference = instruction.getReference<MethodReference>() ?: return@mapIndexedNotNull null
             val parameters = reference.parameterTypes.map(CharSequence::toString)
             (index to reference).takeIf {
-                reference.returnType == IMMUTABLE_LIST_DESCRIPTOR &&
-                    parameters.size == 1 &&
-                    parameters[0] == ITERABLE_DESCRIPTOR
+                parameters.size == 1 &&
+                    parameters[0] == ITERABLE_DESCRIPTOR &&
+                    isImmutableListType(reference.returnType)
             }
         }
     val conversion = requireExactlyOne("NewX media-sheet immutable list conversion", conversions)
@@ -289,8 +303,16 @@ private fun filterMediaSheetOptions(
         // The sheet renderer expects the app's immutable list type, so reuse the resolved
         // conversion instead of handing it the extension's ArrayList.
         invokeStatic(conversionReference, resultRegister)
-        moveResult(resultRegister, IMMUTABLE_LIST_DESCRIPTOR)
+        moveResult(resultRegister, conversionReference.returnType)
     }
+}
+
+private fun isImmutableListType(descriptor: String): Boolean {
+    if (!descriptor.startsWith(IMMUTABLE_COLLECTIONS_PACKAGE)) return false
+    // The top-level package only holds the API interfaces; implementations live in subpackages.
+    if (descriptor.removePrefix(IMMUTABLE_COLLECTIONS_PACKAGE).contains('/')) return false
+    val classDef = classDefByOrNull(descriptor) ?: return false
+    return AccessFlags.INTERFACE.isSet(classDef.accessFlags) && LIST_DESCRIPTOR in classDef.interfaces
 }
 
 private fun patchMediaSheetLabelBridge(model: ResolvedMediaSheetLabel) {
@@ -312,8 +334,7 @@ private fun patchMediaSheetLabelBridge(model: ResolvedMediaSheetLabel) {
 
     bridge.insertHook(0, relocateBranchTargets = false) {
         checkCast(register, model.rowDescriptor)
-        invokeVirtual(model.labelGetter, register)
-        moveResult(register, model.labelGetter.returnType)
+        readModelAccessor(model.labelAccessor, register)
         checkCast(register, model.labelDescriptor)
         iget(register, register, model.labelResourceField)
         returnValue(register)
