@@ -41,10 +41,11 @@ private val SPACES_BAR_TAIL =
         "I",
     )
 private val SPACES_BAR_CALLBACK_DESCRIPTORS =
-    setOf(FUNCTION_ONE_DESCRIPTOR, FUNCTION_TWO_DESCRIPTOR)
+    setOf(FUNCTION_ZERO_DESCRIPTOR, FUNCTION_ONE_DESCRIPTOR, FUNCTION_TWO_DESCRIPTOR)
 
 // Callback band between the prefix and the trailing (Function0, Composer, Int, Int) group.
-// Releases add callbacks and widen them to Function2; cardinality is asserted on the renderer.
+// Releases add callbacks and widen them to Function2 (12.45 added a second Function0);
+// cardinality is asserted on the renderer.
 private const val MINIMUM_SPACES_BAR_CALLBACK_COUNT = 2
 
 private fun Method.hasKnownSpacesBarSignature(): Boolean {
