@@ -1,7 +1,11 @@
 package app.crimera.patches.newx.misc.navbar
 
 import app.crimera.patches.newx.utils.unsupportedOnMount
+import app.crimera.patches.newx.misc.drawer.DrawerItemModel
+import app.crimera.patches.newx.misc.drawer.DrawerMenuItemRenderer
 import app.crimera.patches.newx.misc.drawer.isDrawerRowRenderer
+import app.crimera.patches.newx.misc.drawer.resolveDrawerItemModelOrNull
+import app.crimera.patches.newx.misc.drawer.resolveDrawerMenuItemRenderer
 import app.crimera.patches.newx.misc.drawer.isStringResourceLookup
 import app.crimera.patches.newx.misc.extension.newXExtensionPatch
 import app.crimera.patches.newx.settings.Categories
@@ -116,6 +120,13 @@ private data class ResolvedNavBarDestination(
     val method: MutableMethod,
     val callIndex: Int,
     val clickRegister: Int,
+    /** Model-driven drawers: capture only when the shared item renderer draws this item type. */
+    val itemGate: NavBarItemGate? = null,
+)
+
+private data class NavBarItemGate(
+    val itemType: String,
+    val itemRegister: Int,
 )
 
 @Suppress("unused")
@@ -155,6 +166,8 @@ val customizeNewXNavBarPatch =
 
             injectNavBarFilter(resolveNewXNavBarFilterTarget(tabDataMatch))
 
+            val itemModel = resolveDrawerItemModelOrNull()
+            val menuItemRenderer = itemModel?.let(::resolveDrawerMenuItemRenderer)
             val destinations =
                 NAV_BAR_DESTINATIONS.mapNotNull { spec ->
                     if (!hasResourceId(ResourceType.STRING, spec.titleResourceName)) {
@@ -164,7 +177,11 @@ val customizeNewXNavBarPatch =
                                 spec.titleResourceName,
                         )
                     }
-                    resolveNavBarDestination(spec)
+                    if (itemModel != null && menuItemRenderer != null) {
+                        resolveModelNavBarDestination(spec, itemModel, menuItemRenderer)
+                    } else {
+                        resolveNavBarDestination(spec)
+                    }
                 }
             val contentTarget = resolveNavBarItemContent(tabData)
             val iconFields = destinations.map { it.iconField } + contentTarget.tabIconFields.values
@@ -367,6 +384,31 @@ private fun resolveNavBarDestination(
     )
 }
 
+/**
+ * Model-driven drawers (12.45+) draw every menu item through one item renderer, so the click is
+ * captured at that renderer's entry for the item type whose title is the destination title.
+ */
+private fun resolveModelNavBarDestination(
+    spec: NavBarDestinationSpec,
+    model: DrawerItemModel,
+    renderer: DrawerMenuItemRenderer,
+): ResolvedNavBarDestination {
+    val titleResourceId = resourceId(ResourceType.STRING, spec.titleResourceName)
+    val alternateTitleResourceId =
+        spec.alternateTitleResourceName?.let { resourceId(ResourceType.STRING, it) }
+    val titleResourceIds = listOfNotNull(titleResourceId, alternateTitleResourceId).map(Long::toInt).toSet()
+    val entry = model.requireEntryWithUniqueIcon(spec.titleResourceName, titleResourceIds)
+    return ResolvedNavBarDestination(
+        spec = spec,
+        titleResourceId = titleResourceId,
+        iconField = entry.iconField!!,
+        method = renderer.method,
+        callIndex = 0,
+        clickRegister = renderer.clickRegister,
+        itemGate = NavBarItemGate(entry.itemType, renderer.itemRegister),
+    )
+}
+
 internal fun List<Instruction>.resolveTitleResourceIdAtRowCall(
     callIndex: Int,
     titleRegister: Int,
@@ -542,7 +584,25 @@ private fun injectDestinationClickCaptures(destinations: List<ResolvedNavBarDest
             returnVoid()
         }
 
+        val gate = destination.itemGate
         destination.method.insertHook(destination.callIndex, relocateBranchTargets = false) {
+            if (gate != null) {
+                // Method entry: every local register is free, so v0 stages the item and click.
+                move(0, gate.itemRegister, OBJECT_DESCRIPTOR)
+                instanceOf(0, 0, gate.itemType)
+                ifEqz(0, Target.Original)
+                move(0, destination.clickRegister, FUNCTION0_DESCRIPTOR)
+                invokeStatic(
+                    ImmutableMethodReference(
+                        NAV_BAR_REPLACEMENT_DESCRIPTOR,
+                        bridgeName,
+                        listOf(FUNCTION0_DESCRIPTOR),
+                        "V",
+                    ),
+                    0,
+                )
+                return@insertHook
+            }
             invokeStatic(
                 ImmutableMethodReference(
                     NAV_BAR_REPLACEMENT_DESCRIPTOR,
