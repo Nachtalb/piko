@@ -1080,20 +1080,27 @@ private fun resolveInlineActionKindLayoutLambda(
             ),
         ).scopedMatchAll().map { it.originalMethod },
         entryModels.inlineActionTypeField,
-    )
+    ) { type -> classDefByOrNull(type)?.let { AccessFlags.ENUM.isSet(it.accessFlags) } == true }
 
+/**
+ * R8 can merge unrelated lambdas of the package into one `invoke` that also reads the action type
+ * (12.45), so the layout lambda is the reader that also builds the kind model.
+ */
 internal fun resolveInlineActionKindLayoutMethod(
     methods: Collection<Method>,
     actionTypeField: FieldReference,
+    isEnumType: (String) -> Boolean,
 ): Method = requireExactlyOne(
     "NewX inline-action kind layout lambda",
     methods.filter { method ->
+        val instructions = method.implementation?.instructions?.toList().orEmpty()
         method.definingClass.startsWith(INLINE_ACTION_BAR_SCOPE) &&
             method.name == "invoke" && method.returnType == "Ljava/lang/Object;" &&
-            method.implementation?.instructions?.any { instruction ->
+            instructions.any { instruction ->
                 instruction.opcode == Opcode.IGET_OBJECT &&
                     instruction.getReference<FieldReference>()?.toString() == actionTypeField.toString()
-            } == true
+            } &&
+            instructions.any { isInlineActionKindModelConstructor(it, isEnumType) }
     },
 )
 
