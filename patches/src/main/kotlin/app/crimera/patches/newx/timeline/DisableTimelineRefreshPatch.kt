@@ -17,6 +17,7 @@ import app.crimera.patches.common.classDefFlatMap
 import app.crimera.patches.common.requireAtMostOne
 import app.crimera.patches.common.requireExactlyOne
 import app.crimera.patches.common.scopedMatchAll
+import app.crimera.patches.common.scopedMatchAllOrNull
 import app.morphe.patcher.Fingerprint
 import app.morphe.patcher.InstructionLocation.MatchAfterImmediately
 import app.morphe.patcher.extensions.InstructionExtensions.instructions
@@ -242,14 +243,15 @@ val disableTimelineRefreshPatch =
                 }
             }
 
-            val homeMatches = NewXHomeReselectFingerprint.scopedMatchAll()
-            if (homeMatches.size != 1) {
-                throw PatchException(
-                    "Expected one NewX home reselect handler, found ${homeMatches.size}: " +
-                        homeMatches.joinToString { it.originalMethod.toString() },
+            // Up to 12.43 the home back-press handler refreshed For You once the foreground timeout
+            // passed. 12.45 removed that handler (and its timeout switch read) from home entirely,
+            // so the gate is optional; the URT request and event guards below still cover it.
+            val homeMatch =
+                requireAtMostOne(
+                    label = "NewX home back-press refresh handler",
+                    candidates = NewXHomeReselectFingerprint.scopedMatchAllOrNull().orEmpty(),
                 )
-            }
-            homeMatches.single().method.apply {
+            homeMatch?.method?.apply {
                 val method = this
                 val read =
                     disableTimelineRefresh.injectRead(
