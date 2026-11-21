@@ -76,6 +76,15 @@ private const val PALETTE_COLOR_COUNT = 17
 private const val ACCENT_TONE_COUNT = 13
 private const val COLOR_SCALE_COUNT = 10
 private const val EXPECTED_FACTORY_COUNT = 3
+private const val LAZY_DESCRIPTOR = "Lkotlin/Lazy;"
+private val MERGE_TERMINATOR_OPCODES =
+    setOf(
+        Opcode.RETURN_VOID,
+        Opcode.RETURN,
+        Opcode.RETURN_WIDE,
+        Opcode.RETURN_OBJECT,
+        Opcode.THROW,
+    )
 private const val REQUIRED_FACTORY_REGISTER_COUNT = 37
 private const val ACCENT_SETTINGS_SCRATCH_REGISTER_COUNT = 3
 private const val ACCENT_SETTINGS_SNAPSHOT_INSTRUCTION_COUNT = 2
@@ -795,10 +804,16 @@ private fun MutableMethod.factoryResultFeedsStore(
                         // kotlin.Lazy(Function0) constructor. The Function0 is
                         // the second invoke register and the constructed Lazy
                         // object is stored immediately, so no move-result exists.
+                        // 12.45 R8-merged the Lazy constructors, so the Function0 may be
+                        // followed by extra (null) parameters; the owner must still be a Lazy.
                         reference.name == "<init>" &&
                             reference.returnType == "V" &&
-                            reference.parameterTypes.map(CharSequence::toString) ==
-                                listOf(FUNCTION0_DESCRIPTOR) &&
+                            functionParameter == 0 &&
+                            (
+                                reference.parameterTypes.size == 1 ||
+                                    classDefByOrNull(reference.definingClass)
+                                        ?.interfaces?.contains(LAZY_DESCRIPTOR) == true
+                            ) &&
                             registers.getOrNull(functionParameter + 1) == allocationRegister &&
                             registers.firstOrNull() == storeRegister &&
                             indexed.index + 1 == storeIndex
@@ -1423,8 +1438,15 @@ private fun wideReadsByOwner(
 private fun isTabSlotColors(method: Method, horizon: String): Boolean {
     val reads = wideReadsByOwner(method, horizon)
     if (reads.size != 1) return false
-    val ownerReads = reads.values.first()
+    val (owner, ownerReads) = reads.entries.first()
     if (ownerReads.size != 2) return false
+    // 12.45 merges tab lambdas whose branches each re-read one captured color field; the slot
+    // renderer reads two distinct colors (primary and secondary) from the color scheme instead.
+    if (owner == method.definingClass) return false
+    val readFields = ownerReads.mapNotNull { (_, instruction) ->
+        instruction.getReference<FieldReference>()?.toString()
+    }
+    if (readFields.distinct().size != 2) return false
     return method.implementation?.instructions?.toList().orEmpty().any { instruction ->
         instruction.getReference<MethodReference>()?.let { reference ->
             reference.definingClass.startsWith(TAB_RENDERER_SCOPE) &&
@@ -2611,16 +2633,29 @@ private fun MutableMethod.injectActivatedLikeTint(unfavoriteIndex: Int): Resolve
             val booleanRegister = unary.value.registersUsed.singleOrNull()
                 ?: return@flatMap emptyList()
 
+            // 12.45 schedules unrelated straight-line work between the merge point and the
+            // boolean test, so the merge goto may land a few instructions before it.
             val mergeGotos = methodInstructions.withIndex().filter { indexed ->
-                indexed.index in (comparisonIndex + 1) until unary.index &&
-                    indexed.value.opcode in setOf(Opcode.GOTO, Opcode.GOTO_16, Opcode.GOTO_32) &&
-                    (indexed.value as? BuilderOffsetInstruction)?.target?.location?.index == unary.index
+                if (indexed.index !in (comparisonIndex + 1) until unary.index ||
+                    indexed.value.opcode !in setOf(Opcode.GOTO, Opcode.GOTO_16, Opcode.GOTO_32)
+                ) {
+                    return@filter false
+                }
+                val mergeTarget = (indexed.value as? BuilderOffsetInstruction)?.target?.location?.index
+                    ?: return@filter false
+                mergeTarget in (indexed.index + 1)..unary.index &&
+                    methodInstructions.subList(mergeTarget, unary.index).all { between ->
+                        between !is BuilderOffsetInstruction &&
+                            between.opcode !in MERGE_TERMINATOR_OPCODES &&
+                            (between as? OneRegisterInstruction)?.registerA != booleanRegister
+                    }
             }
             if (mergeGotos.size != 1) return@flatMap emptyList()
             val mergeGotoIndex = mergeGotos.single().index
+            val mergeTargetIndex = (mergeGotos.single().value as BuilderOffsetInstruction).target.location.index
             val fallthroughEnd = minOf(comparisonTarget, mergeGotoIndex)
             val targetEnd =
-                if (comparisonTarget < mergeGotoIndex) mergeGotoIndex else unary.index
+                if (comparisonTarget < mergeGotoIndex) mergeGotoIndex else mergeTargetIndex
             if (fallthroughEnd <= comparisonIndex + 1 || targetEnd <= comparisonTarget) {
                 return@flatMap emptyList()
             }
