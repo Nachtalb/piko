@@ -50,12 +50,15 @@ public final class NativeDownloadRouter {
      * @return true when the SAF pipeline accepted the download; false to keep the native flow
      */
     public static boolean route(Object post, String url, String mimeType) {
+        boolean routed = false;
         try {
-            return routeOrFallback(post, url, mimeType);
+            routed = routeOrFallback(post, url, mimeType);
         } catch (RuntimeException exception) {
             NewXLogger.printException(() -> "Failed to route the NewX native download", exception);
-            return false;
         }
+        // An unrouted download continues in the app's own download flow.
+        if (!routed) AutoLikeDownloads.nativeDownloaded(post);
+        return routed;
     }
 
     private static boolean routeOrFallback(
@@ -107,12 +110,13 @@ public final class NativeDownloadRouter {
         Context applicationContext = context.getApplicationContext();
         Context safeContext = applicationContext != null ? applicationContext : context;
         ENQUEUE_EXECUTOR.execute(() ->
-                enqueue(safeContext, kind, fileName, url, mimeType, username));
+                enqueue(safeContext, post, kind, fileName, url, mimeType, username));
         return true;
     }
 
     private static void enqueue(
             Context context,
+            Object post,
             NewXDownloadFolders.MediaKind kind,
             String fileName,
             String url,
@@ -158,7 +162,10 @@ public final class NativeDownloadRouter {
 
         EnqueueResult result = engine.enqueue(request);
         switch (result.state()) {
-            case QUEUED -> postStatus("Download started", username);
+            case QUEUED -> {
+                postStatus("Download started", username);
+                AutoLikeDownloads.nativeDownloaded(post);
+            }
             case SKIPPED -> postStatus("Already downloaded", username);
             case DESTINATION_LOST -> {
                 NewXDownloadFolders.invalidate(kind);

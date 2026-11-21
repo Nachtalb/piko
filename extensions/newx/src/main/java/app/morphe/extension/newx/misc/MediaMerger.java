@@ -255,6 +255,7 @@ public final class MediaMerger {
             try {
                 writeMergedBitmap(context, mergedBitmap, reservation.documentUri(), format);
                 NewXLogger.printInfo(() -> LOG_PREFIX + "Successfully merged and saved " + reservation.fileName());
+                AutoLikeDownloads.downloaded(postContext);
                 InlineDownloadButton.reportDownloadStatus(
                         "Merged image saved: " + reservation.fileName(), username);
             } catch (Exception exception) {

@@ -39,6 +39,7 @@ public final class InlineActionFilter {
     ) {
         if (actions == null) return null;
 
+        AutoLikeDownloads.remember(presenter);
         if (hiddenActionIds != null && !hiddenActionIds.isEmpty()) {
             actions = filterHiddenActions(actions, hiddenActionIds);
         }
@@ -90,7 +91,7 @@ public final class InlineActionFilter {
         return null;
     }
 
-    private static String inlineActionName(Object action) {
+    static String inlineActionName(Object action) {
         String directName = null;
         try {
             directName = getActionName(action);

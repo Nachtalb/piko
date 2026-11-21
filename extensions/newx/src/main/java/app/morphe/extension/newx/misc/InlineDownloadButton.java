@@ -169,6 +169,7 @@ public final class InlineDownloadButton {
             downloads = downloadItems(mediaFor(post));
             postContext = DownloadFileName.PostContext.fromText(postText);
             username = NewXUtils.sourceUsername(postText);
+            AutoLikeDownloads.track(postContext, post);
         } catch (RuntimeException exception) {
             NewXLogger.printException(() -> "Failed to process inline download action", exception);
             NewXUtils.runOnUiThread(() -> NewXInAppNotification.show("Could not download post media"));
@@ -250,7 +251,7 @@ public final class InlineDownloadButton {
         if (post == null) return false;
 
         try {
-            Object canonicalPost = canonicalPost(post);
+            Object canonicalPost = canonicalPostOf(post);
             if (hasCompositionDownloadableMedia(mediaForCanonical(canonicalPost))) return true;
 
             Object repostedPost = getRepostedPost(post);
@@ -311,8 +312,12 @@ public final class InlineDownloadButton {
         return null;
     }
 
-    private static Object canonicalPost(Object post) {
+    static Object canonicalPostOf(Object post) {
         return getCanonicalPost(post);
+    }
+
+    static Object contextualPostOf(Object timelinePost) {
+        return getContextualPost(timelinePost);
     }
 
     // Alpha and beta model descriptors/getters differ; these bridges are resolved by the patch,
@@ -397,7 +402,7 @@ public final class InlineDownloadButton {
         List<?> repostedMedia = repostedPost == null
                 ? java.util.Collections.emptyList()
                 : mediaForCanonical(getRepostedCanonicalPost(repostedPost));
-        return selectMedia(mediaForCanonical(canonicalPost(post)), repostedMedia);
+        return selectMedia(mediaForCanonical(canonicalPostOf(post)), repostedMedia);
     }
 
     private static List<?> mediaForCanonical(Object canonicalPost) {
@@ -1132,6 +1137,8 @@ public final class InlineDownloadButton {
         EnqueueResult result = engine.enqueue(request);
         if (result.state() == EnqueueState.DESTINATION_LOST) {
             NewXDownloadFolders.invalidate(kind);
+        } else if (result.state() == EnqueueState.QUEUED) {
+            AutoLikeDownloads.downloaded(postContext);
         }
         return result.state();
     }
