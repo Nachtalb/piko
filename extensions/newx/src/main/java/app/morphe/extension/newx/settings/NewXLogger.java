@@ -113,6 +113,21 @@ public final class NewXLogger {
         }
     }
 
+    /**
+     * Records a failed post of the v2 upload runner, which reports an error model instead of a
+     * throwable. Coroutine resumes call in with a null error and are ignored.
+     */
+    public static void captureUploadFailure(Object error, Object step) {
+        if (error == null) return;
+
+        try {
+            if (!isServerLoggingEnabled()) return;
+            LOGGER.capture("POST_FAILURE", "step=" + step + " " + error, null);
+        } catch (Throwable ignored) {
+            // Diagnostics must never turn a handled upload failure into an app crash.
+        }
+    }
+
     static List<String> snapshotServerLogs() {
         return LOGGER.snapshotCaptured();
     }

@@ -1,7 +1,7 @@
 package app.crimera.patches.newx.misc.serverlogging
 
 import app.crimera.patches.newx.utils.unsupportedOnMount
-import app.crimera.patches.common.scopedMatchAll
+import app.crimera.patches.common.scopedMatchAllOrNull
 import app.crimera.patches.newx.misc.extension.newXExtensionPatch
 import app.crimera.patches.newx.settings.Categories
 import app.crimera.patches.newx.settings.Groups
@@ -34,6 +34,8 @@ import com.android.tools.smali.dexlib2.iface.reference.StringReference
 
 private const val ERROR_PACKAGE = "Lcom/x/repositories/errors/"
 private const val COMPOSER_WORK_SCOPE = "Lcom/x/composer/work/"
+private const val UPLOAD_RUNNER_SCOPE = "Lcom/x/composer/upload/"
+private const val UPLOAD_ERROR_SCOPE = "Lcom/x/upload/core/error/"
 private const val EXCEPTION_DESCRIPTOR = "Ljava/lang/Exception;"
 private const val OBJECT_DESCRIPTOR = "Ljava/lang/Object;"
 private const val FUNCTION_1_DESCRIPTOR = "Lkotlin/jvm/functions/Function1;"
@@ -70,6 +72,14 @@ private object SubmitWorkHandlerFingerprint : Fingerprint(
         fieldAccess(opcode = Opcode.IGET_OBJECT, type = THROWABLE_DESCRIPTOR),
         fieldAccess(opcode = Opcode.SGET_OBJECT, name = POST_FAILURE_FIELD_NAME),
     ),
+)
+
+/** v2 upload runner: the single-post failure handler logs "run: failed step=" (12.43+). */
+private object UploadRunnerFailureFingerprint : Fingerprint(
+    definingClass = UPLOAD_RUNNER_SCOPE,
+    returnType = OBJECT_DESCRIPTOR,
+    parameters = listOf("L", UPLOAD_ERROR_SCOPE, "L", CONTINUATION_DESCRIPTOR),
+    filters = listOf(string("run: failed step=")),
 )
 
 internal data class RegisterLocation(
@@ -251,14 +261,34 @@ private fun patchServerErrorConstructors() {
 }
 
 private fun patchSubmitFailureHandler() {
-    val matches = SubmitWorkHandlerFingerprint.scopedMatchAll()
-    if (matches.size != 1) {
+    // 12.43 posts through either the legacy SubmitWorkHandler or the v2 upload runner; 12.45
+    // removed the legacy handler. Hook every pipeline present, and at least one must be.
+    val legacy = SubmitWorkHandlerFingerprint.scopedMatchAllOrNull().orEmpty()
+    val runner = UploadRunnerFailureFingerprint.scopedMatchAllOrNull().orEmpty()
+    if (legacy.size > 1 || runner.size > 1 || legacy.isEmpty() && runner.isEmpty()) {
         throw PatchException(
-            "Expected one NewX submit work handler, found ${matches.size}: " +
-                matches.joinToString { "${it.originalClassDef.type}->${it.originalMethod}" },
+            "Expected at most one NewX submit work handler and upload runner failure handler, " +
+                "and at least one of them, found legacy=" +
+                legacy.joinToString { "${it.originalClassDef.type}->${it.originalMethod}" } +
+                " runner=" + runner.joinToString { "${it.originalClassDef.type}->${it.originalMethod}" },
         )
     }
-    patchSubmitFailureMethod(matches.single().method)
+    legacy.singleOrNull()?.let { patchSubmitFailureMethod(it.method) }
+    runner.singleOrNull()?.let { patchUploadRunnerFailureMethod(it.method) }
+}
+
+private fun patchUploadRunnerFailureMethod(method: MutableMethod) {
+    // (post, error, step, continuation): log the error model and the step at entry.
+    val error = method.p0Register + 2
+    method.insertHook(0, relocateBranchTargets = false) {
+        invokeStatic(
+            methodReference(
+                "$LOGGER_DESCRIPTOR->captureUploadFailure(${OBJECT_DESCRIPTOR}$OBJECT_DESCRIPTOR)V",
+            ),
+            error,
+            error + 1,
+        )
+    }
 }
 
 private fun patchSubmitFailureMethod(method: MutableMethod) {
